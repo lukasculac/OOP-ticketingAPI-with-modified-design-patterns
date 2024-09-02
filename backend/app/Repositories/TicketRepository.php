@@ -1,0 +1,239 @@
+<?php
+
+namespace App\Repositories;
+
+use App\Filters\V1\TicketsFIlter;
+use App\Http\Resources\V1\TicketCollection;
+use App\Http\Resources\V1\TicketResource;
+use App\Models\File;
+use App\Models\Ticket;
+use App\Services\TicketHandler;
+use App\Strategies\HighPriorityTicketHandlingStrategy;
+use App\Strategies\LowPriorityTicketHandlingStrategy;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
+
+class TicketRepository implements TicketRepositoryInterface
+{
+
+    public function index(Request $request)
+    {
+        // Get the currently authenticated worker
+        $worker = auth('sanctum')->user();
+
+        if (!$worker) {
+            // If not, return a 401 Unauthorized response
+            return response()->json(['message' => 'Unauthenticated.'], 401);
+        }
+
+        $filter = new TicketsFilter();
+        $filterItems = $filter->transform($request); //[['column', 'operator', 'value']]
+        $includeFiles = $request->query('includeFiles');
+
+        // Filter the tickets based on the authenticated worker's ID
+        $tickets = Ticket::where('worker_id', $worker->id)->where($filterItems);
+
+        if($includeFiles){
+            $tickets = $tickets->with('files');
+        }
+        return new TicketCollection($tickets->paginate()->appends($request->query()));
+    }
+
+    public function store(Request $request)
+    {
+        // Get the currently authenticated worker
+        $worker = auth('sanctum')->user();
+        //log::info($request);
+
+        if (!$worker) {
+            // If not, return a 401 Unauthorized response
+            return response()->json(['message' => 'Unauthenticated.'], 401);
+        }
+        // Validate the request data
+        $request->validate([
+            'department' => 'required|string',
+            'message' => 'required|string',
+            'files.*' => 'file'
+        ]);
+
+
+        // Create a new ticket and associate it with the worker
+        $ticket = new Ticket;
+        $ticket->department = $request->department;
+        $ticket->message = $request->message;
+        $ticket->worker_id = $worker->id;
+        $ticket->save();
+
+        $ticket->refresh();
+
+        // Check if there are any files in the request
+        if ($request->has('files')) {
+            foreach ($request->file('files') as $file) {
+                $extension = $file->extension();
+                $originalName = $file->getClientOriginalName() . '_' . $ticket->id . '.' . $extension;
+                $path = $file->storeAs('files', $originalName);
+
+                // Create a new file record and associate it with the ticket and the worker
+                $fileRecord = new File;
+                $fileRecord->file_name = $originalName;
+                $fileRecord->path = $path;
+                $fileRecord->ticket_id = $ticket->id;
+                $fileRecord->worker_id = $worker->id;
+                $fileRecord->save();
+            }
+        }
+        return new TicketResource($ticket->load('files'));
+    }
+
+    public function show(Ticket $ticket)
+    {
+        $includeFiles = request()->query('includeFiles');
+        if($includeFiles){
+            return new TicketResource($ticket->loadMissing('files'));
+        }
+        return new TicketResource($ticket);
+    }
+
+    public function update(Request $request, Ticket $ticket)
+
+    {
+        // Validate the request data
+        $validatedData = $request->validate([
+            'department' => 'required|string',
+            'message' => 'required|string',
+            'files.*' => 'file'
+        ]);
+        $ticket->update($validatedData);
+
+
+        if ($request->has('files')) {
+            foreach ($request->file('files') as $file) {
+                // Store the file and get its path
+                $filename = pathinfo($file->getClientOriginalName(), PATHINFO_FILENAME);
+                $extension = pathinfo($file->getClientOriginalName(), PATHINFO_EXTENSION);
+                $originalName = $filename . '_' . $ticket->id . '.' . $extension;
+                $path = $file->storeAs('files', $originalName);
+
+                // Check if file already exists in the database
+                if (!File::where('file_name', $originalName)->exists()) {
+                    // Create a new file record and associate it with the ticket
+                    $fileRecord = new File;
+                    $fileRecord->file_name = $originalName;
+                    $fileRecord->path = $path;
+                    $fileRecord->ticket_id = $ticket->id;
+                    $fileRecord->worker_id = $ticket->worker_id;
+                    $fileRecord->save();
+                }
+            }
+        }
+
+        event('eloquent.eddited: ' . Ticket::class, $ticket);
+        return new TicketResource($ticket);
+    }
+
+    public function submitResponse(Request $request, Ticket $ticket)
+    {
+        $validatedData = $request->validate([
+            'response' => 'required|string',
+        ]);
+        $validatedData['status'] = 'closed';
+        $validatedData['closed_at'] = now();
+        $ticket->update($validatedData);
+        event('eloquent.closed: ' . Ticket::class, $ticket);
+        return new TicketResource($ticket);
+    }
+
+    public function handleTicketState(Request $request, Ticket $ticket)
+    {
+        $validatedData = $request->validate([
+            'status' => 'required|string',
+        ]);
+
+        if($ticket->status === 'pending'){
+            if($validatedData['status'] === 'opened'){
+                $validatedData['opened_at'] = now();
+                event('eloquent.openned: ' . Ticket::class, $ticket);
+                $ticket->update($validatedData);
+            }
+        }
+        return new TicketResource($ticket);
+    }
+
+    public function updateTicketPriorities()
+    {
+        // Get all tickets
+        $tickets = Ticket::all();
+
+        // Get the current time
+        $now = now();
+
+        foreach ($tickets as $ticket) {
+
+            //testing the strategies
+            $ticketHandler = new TicketHandler();
+            if ($ticket->priority === 'high') {
+                $ticketHandler->setStrategy(new HighPriorityTicketHandlingStrategy());
+            } else {
+                $ticketHandler->setStrategy(new LowPriorityTicketHandlingStrategy());
+            }
+            $ticketHandler->handleTicket($ticket);
+            //////////////////////////////////////////////////////////////////
+
+            // Calculate the difference in minutes between the current time and the ticket's creation time
+            $minutesSinceCreation = ($ticket->created_at)->diffInMinutes($now);
+            // Update the ticket's priority based on the time elapsed since its creation
+            if ($minutesSinceCreation >= 10) {
+                event('eloquent.priorityHigh: ' . Ticket::class, $ticket);
+                $ticket->priority = 'high';
+            } elseif ($minutesSinceCreation >= 5) {
+                event('eloquent.priorityMedium: ' . Ticket::class, $ticket);
+                $ticket->priority = 'medium';
+            }
+
+            // Save the updated ticket
+            $ticket->save();
+        }
+    }
+
+    public function destroy(Ticket $ticket)
+    {
+        foreach ($ticket->files as $file) {
+            $file->delete();
+            Storage::delete($file->path);
+        }
+
+        $ticket->delete();
+        return response()->json(null, 204);
+    }
+
+
+    public function findNotClosed()
+    {
+        $ticketIds = Ticket::where('status', '!=', 'closed')
+            ->pluck('id');
+
+        Log::channel('custom')->info('Tickets that are not closed: ' . implode(', ', $ticketIds->toArray()));
+
+    }
+
+    public function findHighPriority()
+    {
+        $ticketIds = Ticket::where('priority', 'high')
+            ->pluck('id');
+
+        Log::channel('custom')->info('Tickets with high priority: ' . implode(', ', $ticketIds->toArray()));
+
+    }
+
+    public function listTicketsOfHighPriorityNotClosed()
+    {
+        $ticketIds = Ticket::where('status', '!=', 'closed')
+            ->where('priority', 'high')
+            ->pluck('id');
+        Log::channel('custom')->info('Unclosed ickets with high priority: ' . implode(', ', $ticketIds->toArray()));
+
+    }
+}
+
+
